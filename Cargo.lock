@@ -3,5 +3,20 @@
 version = 4
 
 [[package]]
+name = "commkit"
+version = "0.1.0"
+
+[[package]]
+name = "commkit-can"
+version = "0.1.0"
+dependencies = [
+ "commkit",
+]
+
+[[package]]
 name = "commkit-iso-15765-2"
 version = "0.1.0"
+dependencies = [
+ "commkit",
+ "commkit-can",
+]
