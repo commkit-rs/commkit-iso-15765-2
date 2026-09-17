@@ -2,7 +2,14 @@
 name = "commkit-iso-15765-2"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "ISO-TP transport layer protocol for CAN-based multi-frame communication"
+repository = "https://github.com/commkit-rs/commkit-iso-15765-2"
+readme = "README.md"
+authors = ["Nick Daria <contact@nickdaria.com>"]
+categories = ["embedded", "no-std", "network-programming"]
+keywords = ["iso-tp", "can", "automotive", "uds", "embedded"]
 
 [dependencies]
-commkit = { path = "../commkit" }
-commkit-can = { path = "../commkit-can" }
+commkit = { path = "../commkit", version = "0.1.0" }
+commkit-can = { path = "../commkit-can", version = "0.1.0" }
