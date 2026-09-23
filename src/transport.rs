@@ -1,4 +1,4 @@
-use commkit::{ByteTransfer, Transport};
+use commkit::{ByteTransfer, Direction, Transport};
 use commkit_can::{CanFrame, CanId, MAX_DATA_LEN};
 
 use crate::config::IsoTpConfig;
@@ -138,7 +138,7 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
     }
 
     fn complete_rx(&mut self, len: usize) {
-        let message = IsoTpMessage::new(&self.rx_buf[..len]);
+        let message = IsoTpMessage::new(Direction::Rx, &self.rx_buf[..len]);
         if let Some(cb) = self.on_message_received {
             cb(message.as_bytes());
         }
