@@ -1,3 +1,5 @@
+use commkit::Duration;
+
 use crate::config::PciFormat;
 use crate::error::IsoTpError;
 
@@ -69,7 +71,8 @@ pub fn parse(data: &[u8], rx_format: PciFormat) -> Result<Pci, IsoTpError> {
             let status = match first & 0x0F {
                 0x0 => FlowStatus::ContinueToSend,
                 0x1 => FlowStatus::Wait,
-                _ => FlowStatus::Overflow,
+                0x2 => FlowStatus::Overflow,
+                _ => return Err(IsoTpError::InvalidFs),
             };
             let block_size = *data.get(1).ok_or(IsoTpError::PciInvalid)?;
             let st_min = *data.get(2).ok_or(IsoTpError::PciInvalid)?;
@@ -150,22 +153,24 @@ pub fn next_seq(seq: u8) -> u8 {
     if seq == 0x0F { 0 } else { seq + 1 }
 }
 
-/// Decodes a flow-control separation-time byte into microseconds.
-pub fn st_min_to_us(byte: u8) -> u32 {
-    match byte {
-        0x00..=0x7F => byte as u32 * 1000,
-        0xF1..=0xF9 => (byte - 0xF0) as u32 * 100,
-        _ => 0,
-    }
+/// Decodes a flow-control separation-time byte. Reserved values decode as the maximum (0x7F = 127ms).
+pub fn st_min_to_duration(byte: u8) -> Duration {
+    let us = match byte {
+        0x00..=0x7F => byte as u64 * 1000,
+        0xF1..=0xF9 => (byte - 0xF0) as u64 * 100,
+        _ => 127_000,
+    };
+    Duration::from_ticks(us)
 }
 
-/// Encodes a microsecond separation time into a flow-control separation-time byte. Values over
-/// 127ms clamp to the maximum (0x7F = 127ms).
-pub fn us_to_st_min(us: u32) -> u8 {
+/// Encodes a separation time into a flow-control separation-time byte, rounding up to the next
+/// encodable value. Values over 127ms clamp to the maximum (0x7F = 127ms).
+pub fn duration_to_st_min(duration: Duration) -> u8 {
+    let us = duration.as_ticks();
     match us {
-        0..100 => 0x00,
-        100..1000 => (us / 100) as u8 + 0xF0,
-        1000..=127_000 => (us / 1000) as u8,
+        0 => 0x00,
+        1..=900 => us.div_ceil(100) as u8 + 0xF0,
+        901..=127_000 => us.div_ceil(1000) as u8,
         _ => 0x7F,
     }
 }

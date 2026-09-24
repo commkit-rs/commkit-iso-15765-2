@@ -1,4 +1,4 @@
-use commkit::{ByteTransfer, Direction, Transport};
+use commkit::{ByteTransfer, Direction, Duration, Instant, Transport};
 use commkit_can::{CanFrame, CanId, MAX_DATA_LEN};
 
 use crate::config::IsoTpConfig;
@@ -9,8 +9,15 @@ use crate::state::IsoTpState;
 
 const PLACEHOLDER_ID: CanId = CanId::Standard(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Timer {
+    Stopped,
+    Arming,
+    Running(Instant),
+}
+
 /// An ISO 15765-2 (ISO-TP) transport for a single logical connection.
-pub struct IsoTpTransport<Inst, const TX_CAP: usize, const RX_CAP: usize> {
+pub struct IsoTpTransport<const TX_CAP: usize, const RX_CAP: usize> {
     ///  Behavior for the ISO-TP transport layer
     pub config: IsoTpConfig,
 
@@ -34,20 +41,21 @@ pub struct IsoTpTransport<Inst, const TX_CAP: usize, const RX_CAP: usize> {
     tx_block_remaining: Option<u16>,
 
     /// Separation time from the partner's last flow-control frame, in microseconds.
-    tx_st_min_us: u32,
+    tx_st_min: Duration,
 
     rx_buf: [u8; RX_CAP],
     rx_len: usize,
     rx_received: usize,
     rx_next_seq: u8,
+    rx_block_remaining: Option<u8>,
     pending_rx: Option<IsoTpMessage<RX_CAP>>,
 
     pending_control: Option<CanFrame>,
 
-    _instant: core::marker::PhantomData<Inst>,
+    timer: Timer,
 }
 
-impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP, RX_CAP> {
+impl<const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<TX_CAP, RX_CAP> {
     pub fn new(config: IsoTpConfig) -> Self {
         Self {
             config,
@@ -60,14 +68,15 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
             tx_sent: 0,
             tx_next_seq: 0,
             tx_block_remaining: None,
-            tx_st_min_us: 0,
+            tx_st_min: Duration::from_ticks(0),
             rx_buf: [0; RX_CAP],
             rx_len: 0,
             rx_received: 0,
             rx_next_seq: 0,
+            rx_block_remaining: None,
             pending_rx: None,
             pending_control: None,
-            _instant: core::marker::PhantomData,
+            timer: Timer::Stopped,
         }
     }
 
@@ -78,12 +87,14 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         self.tx_sent = 0;
         self.tx_next_seq = 0;
         self.tx_block_remaining = None;
-        self.tx_st_min_us = 0;
+        self.tx_st_min = Duration::from_ticks(0);
         self.rx_len = 0;
         self.rx_received = 0;
         self.rx_next_seq = 0;
+        self.rx_block_remaining = None;
         self.pending_rx = None;
         self.pending_control = None;
+        self.timer = Timer::Stopped;
     }
 
     /// Bytes sent so far / total length of the transmission in progress (`0/0` when idle).
@@ -96,13 +107,13 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         (self.rx_received, self.rx_len)
     }
 
-    /// Microseconds the caller should wait before calling `packet_tx` again. Zero means the
+    /// Time the caller should wait before calling `packet_tx` again. Zero means the
     /// caller is not requesting pacing
-    pub fn packet_tx_separation_us(&self) -> u32 {
+    pub fn packet_tx_separation(&self) -> Duration {
         if self.state == IsoTpState::Transmitting {
-            self.tx_st_min_us
+            self.tx_st_min
         } else {
-            0
+            Duration::from_ticks(0)
         }
     }
 
@@ -137,6 +148,13 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         self.pending_control = Some(self.finish_frame(&mut buf, len));
     }
 
+    fn queue_continue_to_send(&mut self) {
+        let block_size = self.config.rx_desired_block_size.unwrap_or(0);
+        let st_min = self.config.rx_desired_separation.map(pci::duration_to_st_min).unwrap_or(0);
+        self.rx_block_remaining = if block_size == 0 { None } else { Some(block_size) };
+        self.queue_flow_control(FlowStatus::ContinueToSend, block_size, st_min);
+    }
+
     fn complete_rx(&mut self, len: usize) {
         let message = IsoTpMessage::new(Direction::Rx, &self.rx_buf[..len]);
         if let Some(cb) = self.on_message_received {
@@ -145,6 +163,7 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         self.pending_rx = Some(message);
         self.rx_len = 0;
         self.rx_received = 0;
+        self.rx_block_remaining = None;
         self.state = IsoTpState::Received;
     }
 
@@ -154,7 +173,7 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         self.tx_sent = 0;
         self.tx_next_seq = 0;
         self.tx_block_remaining = None;
-        self.tx_st_min_us = 0;
+        self.tx_st_min = Duration::from_ticks(0);
     }
 
     fn on_single_frame(&mut self, payload: &[u8], len: usize) -> Result<(), IsoTpError> {
@@ -187,20 +206,19 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         self.rx_len = total_len;
         self.rx_next_seq = 1;
         self.state = IsoTpState::Receiving;
+        self.timer = Timer::Arming;
 
-        let block_size = self.config.rx_desired_block_size.unwrap_or(0);
-        let st_min = self.config.rx_desired_separation_us.map(pci::us_to_st_min).unwrap_or(0);
-        self.queue_flow_control(FlowStatus::ContinueToSend, block_size, st_min);
+        self.queue_continue_to_send();
 
         Ok(())
     }
 
     fn on_consecutive_frame(&mut self, payload: &[u8], seq: u8) -> Result<(), IsoTpError> {
         if self.state != IsoTpState::Receiving {
-            return self.fail(IsoTpError::PciUnexpected);
+            return self.fail(IsoTpError::UnexpPdu);
         }
         if seq != self.rx_next_seq {
-            return self.fail(IsoTpError::UnexpectedSequenceNumber);
+            return self.fail(IsoTpError::WrongSn);
         }
 
         let remaining = self.rx_len - self.rx_received;
@@ -212,6 +230,14 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
         if self.rx_received >= self.rx_len {
             let len = self.rx_len;
             self.complete_rx(len);
+        } else {
+            self.timer = Timer::Arming;
+            if let Some(remaining_block) = self.rx_block_remaining.as_mut() {
+                *remaining_block -= 1;
+                if *remaining_block == 0 {
+                    self.queue_continue_to_send();
+                }
+            }
         }
 
         Ok(())
@@ -219,23 +245,24 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
 
     fn on_flow_control(&mut self, status: FlowStatus, block_size: u8, st_min: u8) -> Result<(), IsoTpError> {
         if !matches!(self.state, IsoTpState::Transmitting | IsoTpState::AwaitingFlowControl) {
-            return self.fail(IsoTpError::PciUnexpected);
+            return self.fail(IsoTpError::UnexpPdu);
         }
 
         match status {
             FlowStatus::ContinueToSend => {
                 self.tx_block_remaining = if block_size == 0 { None } else { Some(block_size as u16) };
-                self.tx_st_min_us = pci::st_min_to_us(st_min);
+                self.tx_st_min = pci::st_min_to_duration(st_min);
                 self.state = IsoTpState::Transmitting;
                 Ok(())
             }
             FlowStatus::Wait => {
                 self.state = IsoTpState::AwaitingFlowControl;
+                self.timer = Timer::Arming;
                 Ok(())
             }
             FlowStatus::Overflow => {
                 self.reset();
-                self.fail(IsoTpError::PartnerAborted)
+                self.fail(IsoTpError::BufferOvflw)
             }
         }
     }
@@ -263,6 +290,7 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
             self.tx_sent = take;
             self.tx_next_seq = 1;
             self.state = IsoTpState::AwaitingFlowControl;
+            self.timer = Timer::Arming;
             return self.finish_frame(&mut buf, hdr + take);
         }
 
@@ -277,6 +305,7 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
             *remaining_block -= 1;
             if *remaining_block == 0 {
                 self.state = IsoTpState::AwaitingFlowControl;
+                self.timer = Timer::Arming;
             }
         }
 
@@ -288,17 +317,16 @@ impl<Inst, const TX_CAP: usize, const RX_CAP: usize> IsoTpTransport<Inst, TX_CAP
     }
 }
 
-impl<Inst, const TX_CAP: usize, const RX_CAP: usize> Default for IsoTpTransport<Inst, TX_CAP, RX_CAP> {
+impl<const TX_CAP: usize, const RX_CAP: usize> Default for IsoTpTransport<TX_CAP, RX_CAP> {
     fn default() -> Self {
         Self::new(IsoTpConfig::default())
     }
 }
 
-impl<Inst: Copy, const TX_CAP: usize, const RX_CAP: usize> Transport for IsoTpTransport<Inst, TX_CAP, RX_CAP> {
+impl<const TX_CAP: usize, const RX_CAP: usize> Transport for IsoTpTransport<TX_CAP, RX_CAP> {
     type Packet = CanFrame;
     type Message = IsoTpMessage<RX_CAP>;
     type Error = IsoTpError;
-    type Instant = Inst;
     type State = IsoTpState;
 
     /// Ingest a CAN frame, must be filtered to only consist of messages bound for this ISO-TP channel
@@ -369,7 +397,32 @@ impl<Inst: Copy, const TX_CAP: usize, const RX_CAP: usize> Transport for IsoTpTr
     }
 
     /// Check the current state
-    fn poll(&mut self, _now: Self::Instant) -> Self::State {
+    fn poll(&mut self, now: Instant) -> Self::State {
+        let timeout = match self.state {
+            IsoTpState::AwaitingFlowControl => Some((self.config.n_bs_timeout, IsoTpError::TimeoutBs)),
+            IsoTpState::Receiving => Some((self.config.n_cr_timeout, IsoTpError::TimeoutCr)),
+            _ => None,
+        };
+
+        match (timeout, self.timer) {
+            (None, _) => self.timer = Timer::Stopped,
+            (Some((duration, _)), Timer::Stopped | Timer::Arming) => self.timer = Timer::Running(now + duration),
+            (Some((_, err)), Timer::Running(deadline)) if now >= deadline => {
+                if err == IsoTpError::TimeoutBs {
+                    self.finish_tx();
+                } else {
+                    self.rx_len = 0;
+                    self.rx_received = 0;
+                    self.rx_next_seq = 0;
+                    self.rx_block_remaining = None;
+                    self.state = IsoTpState::Idle;
+                }
+                self.timer = Timer::Stopped;
+                let _ = self.fail(err);
+            }
+            _ => {}
+        }
+
         self.state
     }
 }

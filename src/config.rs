@@ -1,3 +1,4 @@
+use commkit::Duration;
 use commkit_can::Dlc;
 
 /// How a Single/First Frame's PCI is read or written.
@@ -38,14 +39,18 @@ pub struct IsoTpConfig {
     /// Separation time requested in flow control frames we send
     ///
     /// None = no delay (0x00)
-    /// uS = requested delay
-    pub rx_desired_separation_us: Option<u32>,
+    /// Duration = requested delay, rounded up to the next encodable STmin and clamped to 127ms
+    pub rx_desired_separation: Option<Duration>,
 
     /// Block size requested in flow control frames we send
     ///
     /// None = send all frames (0x00)
     /// Block size = frames per block before another FC is required
     pub rx_desired_block_size: Option<u8>,
+
+    pub n_bs_timeout: Duration,
+
+    pub n_cr_timeout: Duration,
 }
 
 impl IsoTpConfig {
@@ -56,8 +61,10 @@ impl IsoTpConfig {
             padding_byte: 0xCC,
             tx_pci_format: PciFormat::Classic,
             rx_pci_format: PciFormat::Classic,
-            rx_desired_separation_us: None,
+            rx_desired_separation: None,
             rx_desired_block_size: None,
+            n_bs_timeout: Duration::from_ticks(1_000_000),
+            n_cr_timeout: Duration::from_ticks(1_000_000),
         }
     }
 
@@ -68,8 +75,10 @@ impl IsoTpConfig {
             padding_byte: 0xCC,
             tx_pci_format: PciFormat::Auto,
             rx_pci_format: PciFormat::Auto,
-            rx_desired_separation_us: None,
+            rx_desired_separation: None,
             rx_desired_block_size: None,
+            n_bs_timeout: Duration::from_ticks(1_000_000),
+            n_cr_timeout: Duration::from_ticks(1_000_000),
         }
     }
 }
